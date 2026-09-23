@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use crate::{activation::ActivationInfo, util::{base64_decode, REQWEST}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
+// The relay holds a request open while the Mac is asleep instead of failing; without a limit that
+// stalled everything waiting on it (iCloud sign-in, and every Find My lookup queued behind it).
+const RELAY_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[derive(Deserialize)]
 pub struct DataResp {
     data: String,
@@ -44,6 +48,7 @@ impl RelayConfig {
     pub async fn get_versions(host: &str, code: &str, beeper_token: &Option<String>) -> Result<Versions, PushError> {
         let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-version-info", host))
             .bearer_auth(code)
+            .timeout(RELAY_TIMEOUT)
             .header("Content-Length", "0");
 
         if let Some(token) = beeper_token {
@@ -151,6 +156,7 @@ impl OSConfig for RelayConfig {
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
         let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-validation-data", self.host))
             .bearer_auth(&self.code)
+            .timeout(RELAY_TIMEOUT)
             .header("Content-Length", "0");
 
         if let Some(token) = &self.beeper_token {

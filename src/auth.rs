@@ -77,6 +77,8 @@ pub struct TokenProvider<T: AnisetteProvider> {
     mme_refreshed: DebugMutex<SystemTime>,
     // last failed MobileMe login, so an offline relay isn't asked again on every token lookup
     mme_failed: DebugMutex<Option<SystemTime>>,
+    // held for the duration of a MobileMe login, so lookups can use existing tokens instead of waiting
+    refreshing: tokio::sync::Mutex<()>,
     os_config: Arc<dyn OSConfig>,
     cache_path: Option<PathBuf>,
 }
@@ -146,6 +148,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             mme_delegate: DebugMutex::new(None),
             mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
             mme_failed: DebugMutex::new(None),
+            refreshing: tokio::sync::Mutex::new(()),
             cache_path: None,
         })
     }
@@ -168,6 +171,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             mme_delegate: DebugMutex::new(delegate),
             mme_refreshed: DebugMutex::new(refreshed),
             mme_failed: DebugMutex::new(None),
+            refreshing: tokio::sync::Mutex::new(()),
             cache_path: Some(cache_path),
         });
 
@@ -176,7 +180,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             tokio::time::sleep(Duration::from_secs(60)).await;
             loop {
                 let Some(provider) = weak.upgrade() else { break };
-                if provider.mme_age().await > MME_RENEW_AGE && !provider.recently_failed().await {
+                if provider.mme_age().await > MME_RENEW_AGE && !provider.recently_failed().await && provider.refreshing.try_lock().is_ok() {
                     match provider.refresh_mme().await {
                         Ok(()) => info!("Renewed MobileMe tokens in the background"),
                         Err(e) => debug!("Background MobileMe renewal failed, will retry: {e}"),
@@ -247,7 +251,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     }
 
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
-        let mut mme = self.mme_delegate.lock().await;
+        let _refreshing = self.refreshing.lock().await;
 
         self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
         let delegates = match login_apple_delegates(&mut *self.account.lock().await, None, &*self.os_config, &[LoginDelegate::MobileMe]).await {
@@ -262,7 +266,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         if let Some(delegate) = &delegates.mobileme {
             self.save_mme(delegate, now);
         }
-        *mme = delegates.mobileme;
+        *self.mme_delegate.lock().await = delegates.mobileme;
         *self.mme_refreshed.lock().await = now;
         *self.mme_failed.lock().await = None;
 
@@ -274,8 +278,12 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         // usually outlive this window
         let have = self.mme_delegate.lock().await.is_some();
         if !have || self.mme_age().await > MME_MAX_AGE {
-            if have && self.recently_failed().await {
-                debug!("MobileMe refresh failed recently, using existing tokens");
+            // with nothing cached, don't queue every lookup behind another slow relay attempt
+            if !have && self.recently_failed().await {
+                return Err(PushError::DeviceNotFound);
+            }
+            if have && (self.recently_failed().await || self.refreshing.try_lock().is_err()) {
+                debug!("MobileMe refresh failed recently or is in progress, using existing tokens");
             } else if let Err(e) = self.refresh_mme().await {
                 if !have { return Err(e) }
                 warn!("MobileMe refresh failed ({e}), using existing tokens");
