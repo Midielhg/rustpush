@@ -215,8 +215,9 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             .get("storageInfoURL").expect("no storage info url?").as_string().unwrap().to_string();
         
         let account = self.account.lock().await;
-        let dsid = account.spd.as_ref().unwrap().get("DsPrsId").expect("no dsid???s").as_unsigned_integer().unwrap().to_string();
-        let adsid = account.spd.as_ref().unwrap().get("adsid").expect("No adsid!").as_string().unwrap().to_string();
+        let a = account.persisted.as_ref().unwrap();
+        let dsid = a.dsid.to_string();
+        let adsid = a.adsid.clone();
 
         let anisette = account.anisette.clone();
         drop(account);
@@ -247,7 +248,7 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     }
 
     pub async fn get_gsa_email(&self) -> Option<String> {
-        self.account.lock().await.username.clone()
+        Some(self.account.lock().await.persisted.as_ref()?.username.clone())
     }
 
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
@@ -366,7 +367,7 @@ async fn build_setup_headers<T: AnisetteProvider>(account: &AppleAccount<T>, os_
     map.extend(base_headers);
 
     map.extend([
-        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.username.as_ref().unwrap().trim(), account.get_pet().expect("No pet b?"))))),
+        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.persisted.as_ref().unwrap().username.trim(), account.get_pet().expect("No pet b?"))))),
         ("User-Agent", format!("iOS iPhone {} iPhone Setup Assistant", os_config.get_register_meta().software_version)),
         ("Cookie", "repairSteps=".to_string()),
         ("X-MMe-Country", "US".to_string()),
@@ -469,12 +470,11 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
 
 pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T>, cookie: Option<&str>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
     let Some(pet) = account.get_pet() else { panic!("No pet!") };
-    let Some(spd) = &account.spd else { panic!("No spd!") };
+    let Some(persist) = &account.persisted else { panic!("No spd!") };
 
-    debug!("Got spd {:?}", spd);
-    let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
+    let adsid = persist.adsid.clone();
 
-    let username = account.username.as_ref().unwrap();
+    let username = persist.username.clone();
     
     // let request = AuthRequest {
     //     apple_id: username.to_string(),

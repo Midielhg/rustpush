@@ -35,7 +35,7 @@ pub mod mmcsp {
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-pub use icloud_auth::{DefaultAnisetteProvider, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
+pub use icloud_auth::{DefaultAnisetteProvider, FetchedToken, PersistAccountData, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
 
 pub use util::{DebugRwLock, DebugMutex};
 use activation::ActivationInfo;
