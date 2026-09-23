@@ -102,7 +102,11 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_adi_mme_info(&self, item: &str, require_mac: bool) -> String {
-        if require_mac {
+        // The iMac identity is only right for ClearADI anisette. Without that feature (e.g. remote
+        // anisette v3), callers still pass require_mac=true whenever the anisette client info isn't
+        // "iPhone OS", so escrow/FindMy/etc. claimed an iMac while GSA login used this device's own
+        // info, and escrow rejected the session with -3001. Stay consistent with login instead.
+        if require_mac && cfg!(feature = "remote-clearadi") {
             // must be mac for ClearADI
             format!("<iMac13,1> <macOS;13.6.4;22G513> <{}>", item)
         } else {
