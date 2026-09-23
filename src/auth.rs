@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, io::Cursor, marker::PhantomData, path::PathBuf, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use aes::{cipher::consts::U16, Aes128};
 use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
@@ -75,8 +75,26 @@ pub struct TokenProvider<T: AnisetteProvider> {
     account: Arc<DebugMutex<AppleAccount<T>>>,
     mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
     mme_refreshed: DebugMutex<SystemTime>,
+    // last failed MobileMe login, so an offline relay isn't asked again on every token lookup
+    mme_failed: DebugMutex<Option<SystemTime>>,
     os_config: Arc<dyn OSConfig>,
+    cache_path: Option<PathBuf>,
 }
+
+/// MobileMe delegate as saved to disk. Getting it needs relay validation data, so without this every
+/// app launch needed the relay Mac online before iCloud features (Find My, keychain, CloudKit) worked.
+#[derive(Serialize, Deserialize)]
+struct CachedMobileMe {
+    tokens: HashMap<String, String>,
+    #[serde(default)]
+    config: Dictionary,
+    refreshed: u64,
+}
+
+const MME_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+// renew early in the background, while the relay happens to be reachable
+const MME_RENEW_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 3);
+const MME_RETRY_AFTER: Duration = Duration::from_secs(60 * 10);
 
 #[derive(Deserialize, Debug)]
 pub struct StorageInfoBytes {
@@ -127,7 +145,62 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             os_config,
             mme_delegate: DebugMutex::new(None),
             mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
+            mme_failed: DebugMutex::new(None),
+            cache_path: None,
         })
+    }
+
+    /// Like [new], but keeps the MobileMe tokens in `cache_path` across launches, falls back to them
+    /// when a refresh fails (relay offline), and renews them in the background once they're
+    /// [MME_RENEW_AGE] old. Must be called inside a tokio runtime.
+    pub fn new_cached(account: Arc<DebugMutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>, cache_path: PathBuf) -> Arc<Self> where T: Send + Sync + 'static {
+        let cached = std::fs::read(&cache_path).ok().and_then(|data| plist::from_bytes::<CachedMobileMe>(&data).ok());
+        let (delegate, refreshed) = match cached {
+            Some(c) => (Some(MobileMeDelegateResponse { tokens: c.tokens, config: c.config }), UNIX_EPOCH + Duration::from_secs(c.refreshed)),
+            None => (None, SystemTime::UNIX_EPOCH),
+        };
+        if delegate.is_some() {
+            info!("Loaded cached MobileMe tokens from {:?}", cache_path);
+        }
+        let provider = Arc::new(Self {
+            account,
+            os_config,
+            mme_delegate: DebugMutex::new(delegate),
+            mme_refreshed: DebugMutex::new(refreshed),
+            mme_failed: DebugMutex::new(None),
+            cache_path: Some(cache_path),
+        });
+
+        let weak = Arc::downgrade(&provider);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                let Some(provider) = weak.upgrade() else { break };
+                if provider.mme_age().await > MME_RENEW_AGE && !provider.recently_failed().await {
+                    match provider.refresh_mme().await {
+                        Ok(()) => info!("Renewed MobileMe tokens in the background"),
+                        Err(e) => debug!("Background MobileMe renewal failed, will retry: {e}"),
+                    }
+                }
+                drop(provider);
+                tokio::time::sleep(Duration::from_secs(60 * 15)).await;
+            }
+        });
+        provider
+    }
+
+    async fn mme_age(&self) -> Duration {
+        SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap_or_default()
+    }
+
+    async fn recently_failed(&self) -> bool {
+        self.mme_failed.lock().await.is_some_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < MME_RETRY_AFTER)
+    }
+
+    fn save_mme(&self, delegate: &MobileMeDelegateResponse, refreshed: SystemTime) {
+        if let Some(path) = &self.cache_path {
+            save_mobileme_cache(path, delegate, refreshed);
+        }
     }
 
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
@@ -177,19 +250,36 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         let mut mme = self.mme_delegate.lock().await;
 
         self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
-        let delegates = login_apple_delegates(&mut *self.account.lock().await, None, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
+        let delegates = match login_apple_delegates(&mut *self.account.lock().await, None, &*self.os_config, &[LoginDelegate::MobileMe]).await {
+            Ok(delegates) => delegates,
+            Err(e) => {
+                *self.mme_failed.lock().await = Some(SystemTime::now());
+                return Err(e);
+            }
+        };
 
+        let now = SystemTime::now();
+        if let Some(delegate) = &delegates.mobileme {
+            self.save_mme(delegate, now);
+        }
         *mme = delegates.mobileme;
-        *self.mme_refreshed.lock().await = SystemTime::now();
+        *self.mme_refreshed.lock().await = now;
+        *self.mme_failed.lock().await = None;
 
         Ok(())
     }
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
-        // refresh every week
-        if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
-            > Duration::from_secs(60 * 60 * 24 * 7) {
-            self.refresh_mme().await?;
+        // refresh every week; if that fails (relay offline) keep using the tokens we have, which
+        // usually outlive this window
+        let have = self.mme_delegate.lock().await.is_some();
+        if !have || self.mme_age().await > MME_MAX_AGE {
+            if have && self.recently_failed().await {
+                debug!("MobileMe refresh failed recently, using existing tokens");
+            } else if let Err(e) = self.refresh_mme().await {
+                if !have { return Err(e) }
+                warn!("MobileMe refresh failed ({e}), using existing tokens");
+            }
         }
         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
     }
@@ -200,6 +290,18 @@ impl<T: AnisetteProvider> TokenProvider<T> {
 pub struct IDSDelegateResponse {
     pub auth_token: String,
     pub profile_id: String,
+}
+
+/// Saves a MobileMe delegate where [TokenProvider::new_cached] loads it from (e.g. right after sign-in).
+pub fn save_mobileme_cache(path: &std::path::Path, delegate: &MobileMeDelegateResponse, refreshed: SystemTime) {
+    let cached = CachedMobileMe {
+        tokens: delegate.tokens.clone(),
+        config: delegate.config.clone(),
+        refreshed: refreshed.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+    };
+    if let Err(e) = plist::to_file_xml(path, &cached) {
+        warn!("Failed to save MobileMe tokens: {e}");
+    }
 }
 
 #[derive(Deserialize)]
