@@ -225,7 +225,9 @@ pub(crate) fn contained_gcm_encrypt(key: &[u8], secret: &[u8]) -> Result<Vec<u8>
 pub(crate) fn contained_gcm_decrypt(key: &[u8], text: &[u8]) -> Result<Vec<u8>, KeystoreError> {
     let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
                 
-    Ok(cipher.decrypt(Nonce::from_slice(&text[..12]), &text[12..]).expect("Failed to GCM"))
+    if text.len() < 12 { return Err(KeystoreError::KeystoreError("GCM ciphertext too short".to_string())) }
+    // return an error instead of panicking so one undecryptable item can't take down state restore
+    cipher.decrypt(Nonce::from_slice(&text[..12]), &text[12..]).map_err(|e| KeystoreError::KeystoreError(format!("Failed to GCM: {e}")))
 }
 
 impl<T: SoftwareKeystoreEncryptor> SoftwareKeystore<T> {
@@ -328,8 +330,9 @@ impl<T: SoftwareKeystoreEncryptor + Send + Sync + 'static> Keystore for Software
             SoftwareKeystoreKey::Aes(e) => {
                 let cipher = Aes256Gcm::new_from_slice(&e).unwrap();
                 
-                let cipher = cipher.decrypt(Nonce::from_slice(&ciphertext[..12]), &ciphertext[12..]).expect("Failed to GCM");
-                cipher
+                if ciphertext.len() < 12 { return Err(KeystoreError::KeystoreError("GCM ciphertext too short".to_string())) }
+                cipher.decrypt(Nonce::from_slice(&ciphertext[..12]), &ciphertext[12..])
+                    .map_err(|e| KeystoreError::KeystoreError(format!("Failed to GCM: {e}")))?
             }
             _ => return Err(KeystoreError::BadKeyType(key.get_type())),
         };
