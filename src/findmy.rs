@@ -1821,8 +1821,28 @@ pub struct FindMyPhoneClient<P: AnisetteProvider> {
     anisette: ArcAnisetteClient<P>,
     server: u8,
     pub devices: Vec<FoundDevice>,
+    // device id -> first name of the family member who owns it; the signed-in user's devices are absent
+    pub device_owners: HashMap<String, String>,
     aps: APSConnection,
     token_provider: Arc<TokenProvider<P>>,
+}
+
+/// Owners from a refreshClient response: each device carries its owner's prsId, and
+/// userInfo.membersInfo names the family members (the signed-in user isn't listed there).
+fn parse_device_owners(raw: &serde_json::Value) -> HashMap<String, String> {
+    let members = &raw["userInfo"]["membersInfo"];
+    let mut owners = HashMap::new();
+    for device in raw["content"].as_array().into_iter().flatten() {
+        let (Some(id), Some(prs)) = (device["id"].as_str(), device.get("prsId")) else { continue };
+        let prs = match prs {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        if let Some(name) = members[&prs]["firstName"].as_str() {
+            owners.insert(id.to_string(), name.to_string());
+        }
+    }
+    owners
 }
 
 impl<P: AnisetteProvider> FindMyPhoneClient<P> {
@@ -1863,6 +1883,7 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
 
         self.server_context = request.server_context;
         self.devices = request.content;
+        self.device_owners = parse_device_owners(&raw_request);
 
         Ok(serde_json::from_value(raw_request)?)
     }
@@ -1875,6 +1896,7 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             anisette,
             server: rand::thread_rng().gen_range(101..=182),
             devices: vec![],
+            device_owners: HashMap::new(),
             aps,
             token_provider
         };
