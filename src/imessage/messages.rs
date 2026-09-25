@@ -451,7 +451,16 @@ impl MessageParts {
                                     } else {
                                         let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
                                         let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                        AttachmentType::MMCS(MMCSFile {
+                                        let mut alternates = vec![];
+                                        for n in 1..16 {
+                                            let attr = |name: &str| attributes.iter().find(|a| a.name.to_string() == format!("{name}-{n}")).map(|a| a.value.clone());
+                                            let (Some(url), Some(owner), Some(sig), Some(key), Some(size)) =
+                                                (attr("mmcs-url"), attr("mmcs-owner"), attr("mmcs-signature-hex"), attr("decryption-key"), attr("file-size")) else { continue };
+                                            let (Ok(sig), Ok(key), Ok(size)) = (decode_hex(&sig), decode_hex(&key), size.parse::<usize>()) else { continue };
+                                            if key.len() < 2 { continue }
+                                            alternates.push(MMCSFile { alternates: vec![], signature: sig, object: owner, url, key: key[1..].to_vec(), size });
+                                        }
+                                        AttachmentType::MMCS(MMCSFile { alternates,
                                             signature: sig.clone(), // chop off first byte because it's not actually the signature
                                             object: get_attr("mmcs-owner", None),
                                             url: get_attr("mmcs-url", None),
@@ -1189,12 +1198,17 @@ pub struct MMCSFile {
     pub url: String,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub key: Vec<u8>,
-    pub size: usize
+    pub size: usize,
+    /// Other representations Apple lists for the same file as numbered attributes (mmcs-url-1,
+    /// file-size-1, ...). For videos the unnumbered one is a small preview (e.g. 224x128) and the full
+    /// quality file is among these.
+    #[serde(default)]
+    pub alternates: Vec<MMCSFile>,
 }
 
 impl From<MMCSTransferData> for MMCSFile {
     fn from(value: MMCSTransferData) -> Self {
-        MMCSFile {
+        MMCSFile { alternates: vec![],
             signature: decode_hex(&value.mmcs_signature_hex).unwrap(),
             object: value.mmcs_owner,
             url: value.mmcs_url,
@@ -1290,7 +1304,7 @@ impl MMCSFile {
         let result = put_mmcs(&mmcs_config, inputs, authorization, progress).await?;
 
 
-        Ok(MMCSFile {
+        Ok(MMCSFile { alternates: vec![],
             signature: prepared.mmcs.total_sig.to_vec(),
             object: result.1.expect("No unique ID??"),
             url: result.0,
@@ -1436,9 +1450,61 @@ impl Attachment {
                 Ok(())
             },
             AttachmentType::MMCS(mmcs) => {
+                let mut progress = progress;
+                let media = self.mime.starts_with("video/") || self.mime.starts_with("image/");
+                if media && !mmcs.alternates.is_empty() {
+                    let mut candidates: Vec<&MMCSFile> = mmcs.alternates.iter().filter(|a| a.size > mmcs.size).collect();
+                    candidates.sort_by(|a, b| b.size.cmp(&a.size));
+                    for alt in candidates {
+                        let mut buf: Vec<u8> = Vec::with_capacity(alt.size);
+                        match alt.get_attachment(apns, &mut buf, &mut progress).await {
+                            Ok(()) if is_complete_media(&buf, &self.mime) => {
+                                info!("Using {} byte representation of {} instead of the {} byte preview", buf.len(), self.name, mmcs.size);
+                                writer.write_all(&buf)?;
+                                return Ok(())
+                            }
+                            Ok(()) => warn!("Skipping {} byte representation of {}: not a complete file", buf.len(), self.name),
+                            Err(e) => warn!("Couldn't download a representation of {}: {e}", self.name),
+                        }
+                    }
+                }
                 mmcs.get_attachment(apns, writer, progress).await
             }
         }
+    }
+}
+
+/// Whether bytes are a whole media file (not a chunk of one): an ISO-BMFF/QuickTime file whose
+/// top-level boxes exactly cover it and include the movie header, or a complete JPEG/PNG/HEIC.
+fn is_complete_media(data: &[u8], mime: &str) -> bool {
+    if data.len() < 16 { return false }
+    if data.starts_with(&[0xFF, 0xD8]) { return data.ends_with(&[0xFF, 0xD9]) }
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) { return data.windows(4).rev().take(64).any(|w| w == b"IEND") }
+    // ISO base media (mp4, mov, heic)
+    let mut off = 0usize;
+    let mut saw_ftyp_or_moov = false;
+    let mut saw_payload = false;
+    while off + 8 <= data.len() {
+        let mut size = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as u64;
+        let typ = &data[off + 4..off + 8];
+        let mut header = 8u64;
+        if size == 1 {
+            if off + 16 > data.len() { return false }
+            size = u64::from_be_bytes(data[off + 8..off + 16].try_into().unwrap());
+            header = 16;
+        } else if size == 0 {
+            size = (data.len() - off) as u64;
+        }
+        if size < header || off as u64 + size > data.len() as u64 { return false }
+        if typ == b"ftyp" || typ == b"moov" { saw_ftyp_or_moov = true }
+        if typ == b"moov" || typ == b"mdat" || typ == b"meta" { saw_payload = true }
+        off += size as usize;
+    }
+    let exact = off == data.len();
+    if mime.starts_with("video/") {
+        exact && saw_ftyp_or_moov && data.windows(4).any(|w| w == b"moov") && saw_payload
+    } else {
+        exact && saw_ftyp_or_moov && saw_payload
     }
 }
 
@@ -1553,7 +1619,7 @@ impl SetTranscriptBackgroundMessage {
     pub fn to_mmcs(&self) -> Option<MMCSFile> {
         match self {
             Self::Remove { .. } => None,
-            Self::Set { object_id, url, signature, key, file_size, .. } => Some(MMCSFile { 
+            Self::Set { object_id, url, signature, key, file_size, .. } => Some(MMCSFile { alternates: vec![], 
                 signature: base64_decode(&signature), 
                 object: object_id.to_string(), 
                 url: url.to_string(), 
@@ -1879,7 +1945,7 @@ impl BaseBalloonBody {
 
 impl Into<MMCSFile> for RawMMCSBalloon {
     fn into(self) -> MMCSFile {
-        MMCSFile {
+        MMCSFile { alternates: vec![],
             signature: self.signature.into(),
             object: self.object,
             url: self.url,
@@ -2721,7 +2787,7 @@ impl MessageInst {
         }
         if let Ok(loaded) = plist::from_value::<RawMmsIncomingMessage>(&value) {
             let data: Vec<u8> = loaded.key.into();
-            let file = MMCSFile {
+            let file = MMCSFile { alternates: vec![],
                 signature: loaded.signature.into(),
                 object: loaded.object_id,
                 url: loaded.download_url,
